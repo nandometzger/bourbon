@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+showcases/
+**/frame_*.png
+*.zip
+*.pth
+.DS_Store

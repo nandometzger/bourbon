@@ -1,0 +1,10 @@
+torch>=1.10.0
+numpy
+matplotlib
+requests
+rasterio
+pystac-client
+planetary-computer
+stackstac
+rioxarray
+earthengine-api
