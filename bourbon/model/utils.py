@@ -103,7 +103,8 @@ def fetch_mpc(lat, lon, date_start, date_end, crop_size=96, ensemble=0):
         bounds_latlon=bbox,
         epsg=epsg,
         fill_value=np.nan,
-        dtype="float64"
+        dtype="float32",
+        rescale=True # Apply STAC scale/offset (Handles baseline 04.00+ shift)
     )
 
     # Group by exact date (YYYY-MM-DD) to merge adjacent tiles
@@ -125,6 +126,11 @@ def fetch_mpc(lat, lon, date_start, date_end, crop_size=96, ensemble=0):
     else:
          print("Downloading data (Median Composite)...")
          data = selected_stack.median(dim="date", skipna=True).compute()
+
+    # Rescale to 0-10000 range (Model Expectation)
+    # stackstac(rescale=True) returns reflectance 0-1.
+    # We map this back to the "Old DN" domain (0-10000) to match training stats.
+    data = data * 10000.0
          
     # Convert to numpy for slicing
     arr = data.values
