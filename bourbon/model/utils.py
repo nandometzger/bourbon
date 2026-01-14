@@ -103,7 +103,6 @@ def fetch_mpc(lat, lon, date_start, date_end, crop_size=96, ensemble=0):
         bounds_latlon=bbox,
         epsg=epsg,
         fill_value=np.nan,
-        dtype="float32",
         rescale=True # Apply STAC scale/offset (Handles baseline 04.00+ shift)
     )
 
