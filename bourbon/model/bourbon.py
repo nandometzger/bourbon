@@ -29,7 +29,7 @@ class BourbonModel(nn.Module):
             return self.core_model({"input": x})
         return self.core_model(x)
         
-    def predict(self, image):
+    def predict(self, image, mask=None):
         """
         Run inference on a numpy image (C, H, W) or batch (B, C, H, W).
         Handles normalization automatically.
@@ -37,6 +37,8 @@ class BourbonModel(nn.Module):
         Args:
             image (np.ndarray): Sentinel-2 image. Channels: [R, G, B, N].
                                Values: Raw reflection (approx 0-10000).
+            mask (np.ndarray): Optional cloud mask (0=Clear, 1=Cloudy). Same shape as H,W.
+                               If ensemble input, shape (N, H, W).
         Returns:
             dict: {
                 'pop_map': np.ndarray (H, W),
@@ -51,7 +53,6 @@ class BourbonModel(nn.Module):
         img_norm = normalize_s2(image)
         
         # 2. To Tensor
-        # 2. To Tensor
         device = next(self.core_model.parameters()).device
         input_tensor = torch.from_numpy(img_norm).float().to(device)
             
@@ -64,42 +65,95 @@ class BourbonModel(nn.Module):
              # Loop through stack
              preds = []
              valid_imgs = []
+             weights = [] # For weighted average
              
              with torch.no_grad():
                  for i in range(input_tensor.shape[0]):
                      x = input_tensor[i].unsqueeze(0) # (1, C, H, W)
                      
-                     # 1. Filter out empty/masked tiles (Coverage check)
+                     # Check Mask (pixel-wise)
+                     if mask is not None:
+                         m = mask[i] # (H, W) boolean or int
+                         # Weight map: 1.0 where clear, 0.0 where cloudy
+                         # Mask: 1=Cloudy. 
+                         w = 1.0 - m.astype(np.float32)
+                         # If image is entirely cloudy (weight sum 0 or bad coverage), skip?
+                         # Only skip if virtually no valid pixels to save compute.
+                         if np.sum(w) < 10: # Arbitrary small number
+                             continue 
+                     else:
+                         w = np.ones((x.shape[2], x.shape[3]), dtype=np.float32)
+
+                     # Coverage check (Standard invalid/zero pixels in image)
                      raw_slice = image[i]
                      nz = np.count_nonzero(np.isfinite(raw_slice) & (raw_slice > 0)) / raw_slice.size
                      if nz < 0.6: continue
                      
-                     # 2. Patch-level Cloud Filter
-                     # Filter out cloudy patches based on Blue band reflectance (Band 2).
-                     # Threshold: If > 20% of pixels exceed 2200 reflectance unit.
-                     cloud_mask = raw_slice[2] > 2200
-                     cloud_ratio = np.count_nonzero(cloud_mask) / cloud_mask.size
-                     if cloud_ratio > 0.2: continue
+                     # Simple Cloud Filter (fallback if no mask provided, or supplementary)
+                     if mask is None:
+                         # Filter out cloudy patches based on Blue band reflectance (Band 2).
+                         cloud_mask = raw_slice[2] > 2200
+                         cloud_ratio = np.count_nonzero(cloud_mask) / cloud_mask.size
+                         if cloud_ratio > 0.2: continue
                      
+                     # Prediction
                      valid_imgs.append(raw_slice)
-                     
                      out = self.core_model({"input": x})
                      pmap = out["popdensemap"].squeeze().cpu().numpy()
-                     preds.append(np.maximum(pmap, 0))
+                     pmap = np.maximum(pmap, 0)
+                     
+                     preds.append(pmap)
+                     weights.append(w)
              
              if not preds:
                  return {'pop_count': 0.0, 'pop_map': None, 'clean_image': None}
-                 
-             avg_map = np.mean(preds, axis=0)
+             
+             # Stack predictions and weights
+             preds_stack = np.stack(preds, axis=0) # (N, H, W)
+             weights_stack = np.stack(weights, axis=0) # (N, H, W)
+             
+             # Robust Weighted Average
+             sum_weights = np.sum(weights_stack, axis=0)
+             sum_weighted_preds = np.sum(preds_stack * weights_stack, axis=0)
+             
+             # Avoid division by zero
+             # Pixels with 0 weight (all cloudy in all images) -> NaN or 0?
+             # Let's fallback to unweighted mean for those pixels to be safe, or 0.
+             # If all pixels are cloud, likely we want 0 or average of cloudy predis.
+             # Fallback: Where sum_weights < epsilon, set weights to 1/N (uniform)
+             fallback_mask = sum_weights < 1e-6
+             if np.any(fallback_mask):
+                 # For these pixels, use uniform average of available predictions
+                 # (assumes preds are somewhat valid even if masked)
+                 # Or better: Just ignore mask for these pixels?
+                 # Let's just set the denominator to 1 to avoid error, and resultant is 0?
+                 # No, better to average.
+                 pass
+             
+             # Safe Division
+             avg_map = np.divide(sum_weighted_preds, sum_weights, out=np.zeros_like(sum_weighted_preds), where=sum_weights>1e-6)
+             
+             # If we have pixels where ALL images were cloudy (sum_weights=0),
+             # avg_map is 0. This might be wrong. 
+             # Let's fill holes with the simple mean of predictions (best guess).
+             simple_mean = np.mean(preds_stack, axis=0)
+             avg_map[fallback_mask] = simple_mean[fallback_mask]
+
              std_map = np.std(preds, axis=0)
              count = np.sum(avg_map)
+             
+             # Create Clean Image Composite
+             # Weighted average of RGBs? Or Median.
+             # Median is robust. But weighted mean is cleaner for transitions.
+             # Let's stick to Median of Valid Images for visualization to avoid blur.
+             clean_image = np.nanmedian(np.stack(valid_imgs), axis=0)
              
              return {
                  'pop_map': avg_map,
                  'pop_count': float(count),
                  'std_map': std_map,
                  'ensemble_count': len(preds),
-                 'clean_image': np.nanmedian(valid_imgs, axis=0)
+                 'clean_image': clean_image
              }
         else:
             # Single
@@ -137,11 +191,11 @@ class BourbonModel(nn.Module):
             size = 96 # Default back to 96 pixels (~1km) if nothing specified
 
         if provider == 'mpc':
-            img, profile = fetch_mpc(lat, lon, date_start, date_end, size, ensemble)
+            img, profile, mask = fetch_mpc(lat, lon, date_start, date_end, size, ensemble)
         else:
-            img, profile = fetch_gee(lat, lon, date_start, date_end, size, ensemble)
+            img, profile, mask = fetch_gee(lat, lon, date_start, date_end, size, ensemble)
             
-        result = self.predict(img)
+        result = self.predict(img, mask=mask)
         result['profile'] = profile
         result['image'] = img # Raw image/stack
         

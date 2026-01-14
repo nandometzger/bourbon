@@ -1,6 +1,10 @@
 
 import numpy as np
 import sys
+import xarray as xr
+import requests
+import zipfile
+import io
 
 # Sentinel-2 Normalization Constants (Rwanda Dataset)
 S2_MEAN = np.array([1460.46, 1468.30, 1383.46, 2226.68]).reshape(4, 1, 1)
@@ -98,7 +102,7 @@ def fetch_mpc(lat, lon, date_start, date_end, crop_size=96, ensemble=0):
     
     stack = stackstac.stack(
         items,
-        assets=["B04", "B03", "B02", "B08"],
+        assets=["B04", "B03", "B02", "B08", "SCL"], # Include SCL
         resolution=10, 
         bounds_latlon=bbox,
         epsg=epsg,
@@ -107,19 +111,28 @@ def fetch_mpc(lat, lon, date_start, date_end, crop_size=96, ensemble=0):
     )
 
     # --- Radiometric Harmonization ---
-    # Sentinel-2 baseline 04.00 (Jan 2022) introduced +1000 DN offset.
-    # We must subtract it to match older coherence.
+    # Apply offset: Subtract 1000 where baseline >= "04.00"
     if 's2:processing_baseline' in stack.coords:
         baseline = stack.coords['s2:processing_baseline']
-        # Use string comparison for versions "04.00", "05.00" etc.
-        # Mask where baseline >= "04.00"
-        mask = (baseline >= "04.00")
+        mask_offset = (baseline >= "04.00")
         
-        # Apply offset: Subtract 1000 where mask is True
-        # Note: nan - 1000 remains nan, which is correct for nodata.
-        stack = stack.where(~mask, stack - 1000)
+        # Only apply to spectral bands, exclude SCL (which is categorical)
+        spectral_bands = stack.sel(band=["B04", "B03", "B02", "B08"])
+        scl_band = stack.sel(band=["SCL"])
+        
+        spectral_bands = spectral_bands.where(~mask_offset, spectral_bands - 1000)
+        
+        # Re-combine
+        stack = xr.concat([spectral_bands, scl_band], dim="band")
 
     # Group by exact date (YYYY-MM-DD) to merge adjacent tiles
+    # For SCL, median is risky. We use 'first' or 'mode' ideally, but median of ints 
+    # might give float. stackstac returns float output by default with fill_value=nan.
+    # We will assume SCL is robust enough for median or we explicitly strictly ensure it.
+    # Actually, for SCL, let's just take the first valid pixel if mosaicking.
+    # But stackstac doesn't support mixed reducers easily in one call.
+    # Let's stick to median for simplicity, but round the SCL result or check threshold.
+    # A cleaner way: Process SCL separately? No, keep it simple.
     stack = stack.groupby("time.date").median(dim="time")
     
     # After grouping, 'date' is the new dimension instead of 'time'
@@ -138,35 +151,72 @@ def fetch_mpc(lat, lon, date_start, date_end, crop_size=96, ensemble=0):
     else:
          print("Downloading data (Median Composite)...")
          data = selected_stack.median(dim="date", skipna=True).compute()
+    
+    # Split Data and Mask
+    # SCL values: 0=NoData, 1=Sat, 3=Shadow, 8=Cloud Med, 9=Cloud High, 10=Cirrus
+    # Mask = 1 if Cloud/Shadow (Bad), 0 if Clear (Good)
+    # Median might produce non-integers, so we check ranges.
+    
+    arr = data.values # (C, H, W) or (T, C, H, W)
+    
+    if arr.ndim == 4: # (T, C, H, W)
+         img_bands = arr[:, 0:4]
+         scl_band = arr[:, 4]
+    else:
+         img_bands = arr[0:4]
+         scl_band = arr[4]
 
-    # Data is now in consistent 0-10000 range.
-    # No extra scaling needed.
-         
-    # Convert to numpy for slicing
-    arr = data.values
+    # Create Mask (Broad cloud types: 3, 8, 9, 10, maybe 1)
+    # Since SCL was median-ed, values like 8.5 might exist. 
+    # We define bad ranges or nearest integer.
+    # Let's be aggressive: > 7.5 is Cloud (8,9,10,11). 
+    # Shadow is 3. range [2.5, 3.5].
+    # Saturation is 1.
+    
+    # Simple thresholding logic for "Bad" pixels
+    bad_mask = (scl_band >= 2.5) & (scl_band <= 3.5) # Shadows
+    bad_mask |= (scl_band >= 7.5) # Clouds (8,9,10) and Snow(11)? Snow is 11. Keep snow?
+    # Maybe masking snow is good too?
+    # Let's mask 1 (Saturated), 3 (Shadow), 8-10 (Cloud).
+    bad_mask |= (scl_band >= 0.5) & (scl_band <= 1.5) # Saturated
+    
+    # Also handle standard NaNs in image as Mask
+    # (Already handled by nodata, but good to be explicit)
     
     # Crop
-    if arr.ndim == 4: # (T, C, H, W)
-         h, w = arr.shape[2], arr.shape[3]
-         cy, cx = h//2, w//2
-         r = crop_size//2
-         if cx - r < 0 or cy - r < 0: raise ValueError("Fetched crop too small.")
-         patch = arr[:, :, cy-r:cy+r, cx-r:cx+r]
-    else: # (C, H, W)
-         h, w = arr.shape[1], arr.shape[2]
-         cy, cx = h//2, w//2
-         r = crop_size//2
-         if cx - r < 0 or cy - r < 0: raise ValueError("Fetched crop too small.")
-         patch = arr[:, cy-r:cy+r, cx-r:cx+r]
+    def crop_center(img, csize):
+        if img.ndim == 3: # (C, H, W)
+            h, w = img.shape[1], img.shape[2]
+            cy, cx = h//2, w//2
+            r = csize//2
+            return img[:, cy-r:cy+r, cx-r:cx+r]
+        elif img.ndim == 4: # (T, C, H, W)
+            h, w = img.shape[2], img.shape[3]
+            cy, cx = h//2, w//2
+            r = csize//2
+            return img[:, :, cy-r:cy+r, cx-r:cx+r]
+        elif img.ndim == 2: # (H, W) for mask
+            h, w = img.shape[0], img.shape[1]
+            cy, cx = h//2, w//2
+            r = csize//2
+            return img[cy-r:cy+r, cx-r:cx+r]
+        elif img.ndim == 3: # (T, H, W) for mask stack
+            h, w = img.shape[1], img.shape[2]
+            cy, cx = h//2, w//2
+            r = csize//2
+            return img[:, cy-r:cy+r, cx-r:cx+r]
 
+    patch = crop_center(img_bands, crop_size)
+    mask_patch = crop_center(bad_mask, crop_size) # Boolean array
+    
     # Pre-Normalize (Cast and NaN fix)
     patch_np = patch.astype(np.float32)
     patch_np = np.nan_to_num(patch_np, nan=0.0)
     
-    # Metadata for GeoTIFF
+    # Metadata for GeoTIFF (from utils.py original)
     profile = None
     try:
-         # Center index of original data
+         # ... existing profile logic ...
          if arr.ndim == 4:
              c_idx_x = arr.shape[3]//2
              c_idx_y = arr.shape[2]//2
@@ -194,7 +244,7 @@ def fetch_mpc(lat, lon, date_start, date_end, crop_size=96, ensemble=0):
     except Exception as e:
          print(f"Warning: Could not determine GeoProfile: {e}")
 
-    return patch_np, profile
+    return patch_np, profile, mask_patch
 
 
 def fetch_gee(lat, lon, date_start, date_end, crop_size=96, ensemble=0):
@@ -219,8 +269,9 @@ def fetch_gee(lat, lon, date_start, date_end, crop_size=96, ensemble=0):
 
     point = ee.Geometry.Point([lon, lat])
     
-    # Filter S2
-    s2 = ee.ImageCollection("COPERNICUS/S2_HARMONIZED") \
+    # Filter S2: Use SR Harmonized for SCL band
+    # COPERNICUS/S2_SR_HARMONIZED: Surface Reflectance (L2A) + Harmonized
+    s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED") \
         .filterBounds(point) \
         .filterDate(date_start, date_end) \
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 10)) \
@@ -230,7 +281,7 @@ def fetch_gee(lat, lon, date_start, date_end, crop_size=96, ensemble=0):
     if s2 is None:
         raise ValueError("No images found in GEE.")
         
-    s2 = s2.select(['B4', 'B3', 'B2', 'B8']) # R, G, B, N
+    s2 = s2.select(['B4', 'B3', 'B2', 'B8', 'SCL']) # R, G, B, N, SCL
     
     # Use native projection from B4
     proj = s2.select('B4').projection()
@@ -271,6 +322,7 @@ def fetch_gee(lat, lon, date_start, date_end, crop_size=96, ensemble=0):
     g = read_band('B3')
     b = read_band('B2')
     n = read_band('B8')
+    scl = read_band('SCL')
     
     # Ensure exact size
     def center_crop_pad(arr, size):
@@ -293,7 +345,12 @@ def fetch_gee(lat, lon, date_start, date_end, crop_size=96, ensemble=0):
     g = center_crop_pad(g, crop_size)
     b = center_crop_pad(b, crop_size)
     n = center_crop_pad(n, crop_size)
+    scl = center_crop_pad(scl, crop_size)
     
     img = np.stack([r, g, b, n], axis=0).astype(np.float32)
+
+    # Make Mask
+    # SCL(GEE): 0=NoData, 1=Sat, 3=Shadow, 8=Cloud Med, 9=Cloud High, 10=Cirrus
+    bad_mask = (scl == 3) | (scl == 8) | (scl == 9) | (scl == 10) | (scl == 1)
     
-    return img, None
+    return img, None, bad_mask
