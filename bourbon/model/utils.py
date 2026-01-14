@@ -103,8 +103,21 @@ def fetch_mpc(lat, lon, date_start, date_end, crop_size=96, ensemble=0):
         bounds_latlon=bbox,
         epsg=epsg,
         fill_value=np.nan,
-        rescale=True # Apply STAC scale/offset (Handles baseline 04.00+ shift)
+        rescale=False 
     )
+
+    # --- Radiometric Harmonization ---
+    # Sentinel-2 baseline 04.00 (Jan 2022) introduced +1000 DN offset.
+    # We must subtract it to match older coherence.
+    if 's2:processing_baseline' in stack.coords:
+        baseline = stack.coords['s2:processing_baseline']
+        # Use string comparison for versions "04.00", "05.00" etc.
+        # Mask where baseline >= "04.00"
+        mask = (baseline >= "04.00")
+        
+        # Apply offset: Subtract 1000 where mask is True
+        # Note: nan - 1000 remains nan, which is correct for nodata.
+        stack = stack.where(~mask, stack - 1000)
 
     # Group by exact date (YYYY-MM-DD) to merge adjacent tiles
     stack = stack.groupby("time.date").median(dim="time")
@@ -126,10 +139,8 @@ def fetch_mpc(lat, lon, date_start, date_end, crop_size=96, ensemble=0):
          print("Downloading data (Median Composite)...")
          data = selected_stack.median(dim="date", skipna=True).compute()
 
-    # Rescale to 0-10000 range (Model Expectation)
-    # stackstac(rescale=True) returns reflectance 0-1.
-    # We map this back to the "Old DN" domain (0-10000) to match training stats.
-    data = data * 10000.0
+    # Data is now in consistent 0-10000 range.
+    # No extra scaling needed.
          
     # Convert to numpy for slicing
     arr = data.values

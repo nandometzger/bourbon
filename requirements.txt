@@ -8,3 +8,5 @@ planetary-computer
 stackstac
 rioxarray
 earthengine-api
+imageio
+pandas

@@ -64,6 +64,7 @@ class BourbonModel(nn.Module):
              # Loop through stack
              preds = []
              valid_imgs = []
+             
              with torch.no_grad():
                  for i in range(input_tensor.shape[0]):
                      x = input_tensor[i].unsqueeze(0) # (1, C, H, W)
