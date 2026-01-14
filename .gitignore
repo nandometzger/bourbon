@@ -12,3 +12,9 @@ test_env/
 build/
 dist/
 *.egg-info/
+
+# Test/Verify Artifacts
+verify_fix*
+kigali_growth/
+test_cli*
+*_output/
