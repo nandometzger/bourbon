@@ -53,7 +53,7 @@ def fetch_mpc(lat, lon, date_start, date_end, crop_size=96, ensemble=0):
         collections=["sentinel-2-l2a"],
         bbox=bbox,
         datetime=f"{date_start}/{date_end}",
-        query={"eo:cloud_cover": {"lt": 10}},
+        query={"eo:cloud_cover": {"lt": 30}},
         sortby="properties.eo:cloud_cover" # Ascending
     )
     
@@ -90,21 +90,47 @@ def fetch_mpc(lat, lon, date_start, date_end, crop_size=96, ensemble=0):
     # EPSG Detection
     ref_item = items[0]
     epsg = ref_item.properties.get("proj:epsg")
+    
     if epsg is None:
         pcode = ref_item.properties.get("proj:code")
         if pcode and pcode.startswith("EPSG:"):
              try: epsg = int(pcode.split(":")[1])
              except: pass
+             
     if epsg is None and "B04" in ref_item.assets:
          epsg = ref_item.assets["B04"].extra_fields.get("proj:epsg")
-    
+         
+    # Fallback: Inspect the actual file header if metadata is missing
+    if epsg is None and "B04" in ref_item.assets:
+        try:
+            import rasterio
+            with rasterio.open(ref_item.assets["B04"].href) as src:
+                epsg = src.crs.to_epsg()
+                print(f"  Inferred EPSG from file header: {epsg}")
+        except Exception as e:
+            print(f"  ⚠️ Could not infer EPSG from file: {e}")
+
+    # Manual Reprojection of Bounds (Force Check)
+    # Stackstac sometimes fails to reproject bounds_latlon correctly (e.g. Kolwezi).
+    # We manually project to target EPSG.
+    try:
+        from pyproj import Transformer
+        transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+        # LAT LON order in bbox is [lon_min, lat_min, lon_max, lat_max] (which is XY)
+        minx, miny = transformer.transform(bbox[0], bbox[1])
+        maxx, maxy = transformer.transform(bbox[2], bbox[3])
+        bounds_utm = (minx, miny, maxx, maxy)
+    except Exception as e:
+        print(f"  ⚠️ Reprojection failed: {e}. Fallback to stackstac defaults.")
+        bounds_utm = None
+
     print(f"Mosaicking tiles by date (EPSG:{epsg})...")
     
     stack = stackstac.stack(
         items,
         assets=["B04", "B03", "B02", "B08", "SCL"], # Include SCL
         resolution=10, 
-        bounds_latlon=bbox,
+        bounds=bounds_utm, # Use projected bounds
         epsg=epsg,
         fill_value=np.nan,
         rescale=False 
@@ -185,26 +211,67 @@ def fetch_mpc(lat, lon, date_start, date_end, crop_size=96, ensemble=0):
     
     # Crop
     def crop_center(img, csize):
+        # Determine shape and dimensions based on input rank
         if img.ndim == 3: # (C, H, W)
             h, w = img.shape[1], img.shape[2]
-            cy, cx = h//2, w//2
-            r = csize//2
-            return img[:, cy-r:cy+r, cx-r:cx+r]
+            spatial_dims = (1, 2)
         elif img.ndim == 4: # (T, C, H, W)
             h, w = img.shape[2], img.shape[3]
-            cy, cx = h//2, w//2
-            r = csize//2
-            return img[:, :, cy-r:cy+r, cx-r:cx+r]
+            spatial_dims = (2, 3)
         elif img.ndim == 2: # (H, W) for mask
             h, w = img.shape[0], img.shape[1]
-            cy, cx = h//2, w//2
-            r = csize//2
-            return img[cy-r:cy+r, cx-r:cx+r]
+            spatial_dims = (0, 1)
         elif img.ndim == 3: # (T, H, W) for mask stack
             h, w = img.shape[1], img.shape[2]
-            cy, cx = h//2, w//2
-            r = csize//2
-            return img[:, cy-r:cy+r, cx-r:cx+r]
+            spatial_dims = (1, 2)
+        else:
+            raise ValueError(f"Unsupported dimensions for crop: {img.ndim}")
+
+        cy, cx = h//2, w//2
+        r = csize//2
+        
+        y1 = max(0, cy-r)
+        y2 = min(h, cy+r)
+        x1 = max(0, cx-r)
+        x2 = min(w, cx+r)
+        
+        # Build slice object dynamically
+        slices = [slice(None)] * img.ndim
+        slices[spatial_dims[0]] = slice(y1, y2)
+        slices[spatial_dims[1]] = slice(x1, x2)
+        
+        out = img[tuple(slices)]
+        
+        # Pad if needed
+        # Check output spatial shape
+        oh = out.shape[spatial_dims[0]]
+        ow = out.shape[spatial_dims[1]]
+        
+        if oh < csize or ow < csize:
+            pad_h = csize - oh
+            pad_w = csize - ow
+            
+            # Center the content in the padding
+            ph1 = pad_h // 2
+            ph2 = pad_h - ph1
+            pw1 = pad_w // 2
+            pw2 = pad_w - pw1
+            
+            pads = [(0,0)] * img.ndim
+            pads[spatial_dims[0]] = (ph1, ph2)
+            pads[spatial_dims[1]] = (pw1, pw2)
+            
+            # Use constant 0 padding (or True for mask? 0 is fine for mask which means valid/clear usually? No, mask 1 is bad. 0 is clear.)
+            # If we pad mask with 0, we say "padded area is clear".
+            # Is that safe? 
+            # If we pad image with 0 (black), prediction will be 0.
+            # Mask 0 means "Valid".
+            # If we pad with 0, model sees black pixels and thinks they are valid data.
+            # Model predicts 0 population on black pixels? Usually yes.
+            # So padding with 0 is consistent with "no data = 0 pop".
+            out = np.pad(out, pads, mode='constant', constant_values=0)
+            
+        return out
 
     patch = crop_center(img_bands, crop_size)
     mask_patch = crop_center(bad_mask, crop_size) # Boolean array

@@ -26,6 +26,17 @@ Bourbon is distilled from **Bag-Of-Popcorn**, an ensemble model trained on **onl
     *   **Distillation**: The student is trained to mimic the teacher's averaged "pseudolabels" over Rwanda using a **LogL1 Loss**.
     *   **Training**: We employ a curriculum learning strategy, starting with non-empty patches and gradually introducing unpopulated regions. The process is extremely efficient -- distillation takes only **40 epochs** (~6 minutes).
 
+## New Features (v1.2)
+
+### 🚦 Uncertainty Quantification
+Bourbon goes beyond single-point estimates by providing **uncertainty quantification**. By running an ensemble of predictions over time-augmented inputs (different satellite passes), we calculate the **spatial standard deviation** of the population count. This "correlated uncertainty" metric captures the model's confidence in the total population estimate, accounting for errors that are spatially correlated across neighborhoods (rather than assuming pixel-independence, which drastically underestimates uncertainty).
+
+### ☁️ Masked Ensembling
+Satellite imagery in tropical regions is often cloudy. Bourbon implements a robust **masked ensembling** strategy:
+1.  Fetches multiple Sentinel-2 scenes for a given time window.
+2.  Generates a cloud mask for each scene.
+3.  Computes a **weighted average** of predictions, where the weight is inverse to cloud cover.
+4.  In extreme cases (fully cloudy pixels), it falls back to the temporal mean, ensuring continuous and gap-free population maps even in challenging weather conditions.
 
 
 ## Contents
@@ -151,13 +162,13 @@ Try Bourbon on interesting urban growth sites with a single command:
 
 **🏙️ Kigali, Rwanda (Modern Development)**
 ```bash
-bourbon-timeseries --name "Kigali" --lat -1.9470 --lon 30.0740 --size_meters 20000 --vmax 1.5
+bourbon-timeseries --name "Kigali" --lat -1.9470 --lon 30.0740 --size_meters 20000 --vmax 2.0
 ```
 ![Kigali Growth](showcases/Kigali_Rwanda/population_growth.gif)
 
 **🏙️ Bunia, DRC (Urban expansion & Refugee Camp)**
 ```bash
-bourbon-timeseries --name "Bunia" --lat 1.5573 --lon 30.2412 --size_meters 10000 --vmax 1.0
+bourbon-timeseries --name "Bunia" --lat 1.5573 --lon 30.2412 --size_meters 10000 --vmax 2.0
 ```
 ![Bunia Growth](showcases/Bunia_DRC/population_growth.gif)
 

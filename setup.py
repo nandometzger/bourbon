@@ -6,7 +6,7 @@ with open('requirements.txt') as f:
 
 setup(
     name='bourbon',
-    version='1.1.4',
+    version='1.2.0',
     description='Bourbon: Distilled Population Maps',
     author='Nando Metzger',
     packages=find_packages(),

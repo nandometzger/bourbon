@@ -148,9 +148,18 @@ class BourbonModel(nn.Module):
              # Let's stick to Median of Valid Images for visualization to avoid blur.
              clean_image = np.nanmedian(np.stack(valid_imgs), axis=0)
              
+             # Calculate uncertainty of the total count (Correlated / True Ensemble Variance)
+             # preds_stack is (N, H, W). Sum over spatial dim (H, W) -> (N,)
+             total_counts = np.sum(preds_stack, axis=(1, 2))
+             std_pop_count = np.std(total_counts)
+
+             # Alternative: Sum of pixel-wise variances (assuming spatial independence)
+             # Removed per user request.
+
              return {
                  'pop_map': avg_map,
                  'pop_count': float(count),
+                 'pop_std': float(std_pop_count),
                  'std_map': std_map,
                  'ensemble_count': len(preds),
                  'clean_image': clean_image

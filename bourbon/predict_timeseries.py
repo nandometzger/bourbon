@@ -9,7 +9,6 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 # Load Bourbon
-# Load Bourbon
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 from bourbon import load_model
 
@@ -54,7 +53,9 @@ def main():
     
     # 2. Get Intervals
     intervals = create_date_intervals()
-    results_vals = [np.nan] * len(intervals) # Aligned with intervals
+    results_vals = [np.nan] * len(intervals) # Pop Counts
+    uncertainty_vals = [np.nan] * len(intervals) # Mean Uncertainty
+    uncertainty_indep_vals = [np.nan] * len(intervals) # Independent Uncertainty
     frames = []
 
     print(f"🥃 Starting Nowcast for ({args.lat}, {args.lon}) across {len(intervals)} years...")
@@ -75,6 +76,7 @@ def main():
             
             pop_count = res.get('pop_count', 0)
             pop_map = res.get('pop_map')
+            std_map = res.get('std_map')
             
             # RGB Input
             rgb_raw = res.get('clean_image')
@@ -88,10 +90,13 @@ def main():
 
             # Update stats
             results_vals[i] = pop_count
+            pop_std_val = res.get('pop_std', 0.0) 
+            uncertainty_vals[i] = pop_std_val 
             
             # Create Frame
             from mpl_toolkits.axes_grid1 import make_axes_locatable
             
+            # 2-panel layout
             fig = plt.figure(figsize=(12, 11))
             if args.name:
                 fig.suptitle(f"{args.name}", fontsize=24, fontweight='bold', y=0.96)
@@ -109,11 +114,6 @@ def main():
             ax_rgb.set_title(f"Sentinel-2 Input ({interval['label']})", fontsize=14, fontweight='bold')
             ax_rgb.axis('off')
 
-            # Hack: Add invisible colorbar to RGB to match aspect ratio resize of MAP
-            divider_rgb = make_axes_locatable(ax_rgb)
-            cax_rgb = divider_rgb.append_axes("right", size="5%", pad=0.1)
-            cax_rgb.axis('off')
-            
             # 2. Pop Map
             # Use fixed vmax if provided, otherwise dynamic
             vmax_val = args.vmax if args.vmax is not None else max(0.1, pop_map.max())
@@ -123,10 +123,23 @@ def main():
             
             divider = make_axes_locatable(ax_map)
             cax = divider.append_axes("right", size="5%", pad=0.1)
-            plt.colorbar(im, cax=cax, label='People / Pixel')
-            
+            cbar = plt.colorbar(im, cax=cax, label='People / Pixel')
+
             # 3. Growth Curve (X-axis aligned with range(len(intervals)))
-            ax_curve.plot(range(len(intervals)), results_vals, marker='o', color='brown', lw=2, alpha=0.6)
+            x_vals = np.arange(len(intervals))
+            # Plot the line
+            ax_curve.plot(x_vals, results_vals, marker='o', color='brown', lw=2, alpha=0.8, label="Population")
+            
+            # Plot Uncertainty Band (1-sigma)
+            # Mask NaNs for fill_between
+            valid_idx = ~np.isnan(results_vals)
+            if np.any(valid_idx):
+                y = np.array(results_vals)[valid_idx]
+                err = np.array(uncertainty_vals)[valid_idx]
+                x = x_vals[valid_idx]
+                
+                ax_curve.fill_between(x, y - err, y + err, color='brown', alpha=0.3, label="Uncertainty (1σ)")
+                
             ax_curve.scatter(i, pop_count, color='red', s=120, zorder=5, edgecolors='black')
             
             ax_curve.set_xlim(-0.5, len(intervals) - 0.5)
@@ -136,7 +149,10 @@ def main():
             ax_curve.set_ylabel("Estimated Population", fontsize=12)
             ax_curve.set_title("Population Growth Timeline", fontsize=14, fontweight='bold')
             ax_curve.grid(True, linestyle='--', alpha=0.5)
-            
+            # Add Legend only once
+            if i == len(intervals) - 1:
+                ax_curve.legend(loc='upper left')
+
             plt.tight_layout(rect=[0, 0, 1, 0.95])
             
             frame_path = os.path.join(args.out_dir, f"frame_{i:03d}.png")
@@ -144,13 +160,20 @@ def main():
             plt.close()
             frames.append(frame_path)
             
-            print(f"  Result: {pop_count:.0f} people")
+            print(f"  Result: {pop_count:.0f} people (Std: {pop_std_val:.2f})")
             
         except Exception as e:
             print(f"  ⚠️ Skipping interval {interval['label']}: {e}")
+            import traceback
+            traceback.print_exc()
 
     # 3. Save CSV
-    df = pd.DataFrame([{ 'date': intv['label'], 'population': val } for intv, val in zip(intervals, results_vals)])
+    df = pd.DataFrame([{ 
+        'date': intv['label'], 
+        'population': val,
+        'uncertainty': unc,
+    } for intv, val, unc in zip(intervals, results_vals, uncertainty_vals)])
+    
     csv_path = os.path.join(args.out_dir, "population_timeseries.csv")
     df.to_csv(csv_path, index=False)
     print(f"\n📈 Timeseries saved to {csv_path}")

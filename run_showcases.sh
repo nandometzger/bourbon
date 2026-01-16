@@ -1,6 +1,4 @@
 #!/bin/bash
-PYTHON=/scratch3/metzgern/random/Popcorn/PopMapEnv/bin/python
-SCRIPT=bourbon/predict_timeseries.py
 
 # Format: "lat | lon | size | display_name"
 declare -a locs=(
@@ -25,21 +23,57 @@ declare -a locs=(
 
 mkdir -p showcases
 
+count=0
+BATCH_SIZE=1
+
+echo "Starting parallel processing (Batch Size: $BATCH_SIZE)..."
+
 for loc in "${locs[@]}"
 do
-   # Split by |
-   IFS='|' read -r lat lon size name <<< "$loc"
+   (
+       # Split by |
+       IFS='|' read -r lat lon size name <<< "$loc"
+       
+       # Trim whitespace
+       lat=$(echo $lat | xargs)
+       lon=$(echo $lon | xargs)
+       size=$(echo $size | xargs)
+       name=$(echo $name | xargs)
+    
+       # Create sanitized folder name
+       folder_name=$(echo $name | tr -cd '[:alnum:] ' | tr ' ' '_')
+    
+       echo "🥃 Processing $name..."
+       
+       # Use direct python script execution to ensure we run the latest code
+       python bourbon/predict_timeseries.py \
+           --lat "$lat" \
+           --lon "$lon" \
+           --size_meters "$size" \
+           --ensemble 5 \
+           --provider mpc \
+           --out_dir "showcases/$folder_name" \
+           --vmax 2.0 \
+           --name "$name" \
+           > "showcases/${folder_name}.log" 2>&1
+       
+       if [ $? -eq 0 ]; then
+           echo "✅ Finished $name"
+       else
+           echo "❌ Failed $name (See showcases/${folder_name}.log)"
+       fi
+   ) &
    
-   # Trim whitespace
-   lat=$(echo $lat | xargs)
-   lon=$(echo $lon | xargs)
-   size=$(echo $size | xargs)
-   name=$(echo $name | xargs)
-
-   # Create sanitized folder name
-   folder_name=$(echo $name | tr -cd '[:alnum:] ' | tr ' ' '_')
-
-   echo "🥃 Processing $name ($folder_name): ($lat, $lon) @ ${size}m"
-   $PYTHON $SCRIPT --lat $lat --lon $lon --size_meters $size --ensemble 5 --provider mpc \
-          --out_dir "showcases/$folder_name" --vmax 2.0 --name "$name"
+   count=$((count+1))
+   if [ $((count % BATCH_SIZE)) -eq 0 ]; then
+       echo "Waiting for batch..."
+       wait
+   fi
 done
+
+wait
+
+echo "🎬 Generating concatenated teaser..."
+python create_teaser.py
+
+echo "✅ All showcases generated!"
