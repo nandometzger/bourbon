@@ -153,7 +153,6 @@ class POPCORN(nn.Module):
         # define urban extractor
         # INSTANTIATE DIRECTLY
         self.building_extractor = DualStreamUNet(dda_cfg)
-        self.building_extractor = self.building_extractor.cuda()
 
 
     def inject_lora(self, module, rank, alpha):

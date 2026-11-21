@@ -116,7 +116,10 @@ import torch
 
 # Load Bourbon (pretrained on Rwanda)
 model = bourbon.load_model(pretrained=True)
-if torch.cuda.is_available(): model.cuda() elif torch.backends.mps.is_available(): model.to('mps')
+if torch.cuda.is_available():
+    model.cuda()
+elif torch.backends.mps.is_available():
+    model.to('mps')
 ```
 
 **Alternative (via TorchHub):**
